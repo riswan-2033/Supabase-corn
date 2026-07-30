@@ -1,0 +1,109 @@
+name: Supabase Keepalive
+
+# ---------------------------------------------------------------------------
+# Pings the Supabase database so the Free plan project is never auto-paused.
+#
+# WHY DAILY AND NOT EVERY 3-4 DAYS?
+#   Supabase's docs say: "Typically a few user requests to the database each
+#   day over the previous week is enough to keep the project from being
+#   paused." A twice-weekly ping has worked for many people, but it sits close
+#   to the edge -- and GitHub's scheduler can delay or silently skip runs
+#   during peak load. A daily run costs ~10 seconds of free CI time, so there
+#   is no reason to cut it fine. Keep daily.
+#
+#   If you really want the every-3-4-days cadence, comment out the daily line
+#   and uncomment the Mon/Thu line instead.
+# ---------------------------------------------------------------------------
+
+on:
+  schedule:
+    - cron: '17 6 * * *'        # every day at 06:17 UTC  <-- recommended
+    # - cron: '17 6 * * 1,4'    # Mondays & Thursdays only (3-4 day gaps)
+  workflow_dispatch:             # lets you run it by hand from the Actions tab
+
+# Needed only by the "keep this workflow itself alive" step at the bottom.
+permissions:
+  contents: write
+
+concurrency:
+  group: supabase-keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Ping Supabase (read + write via RPC)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SUPABASE_URL:-}" ] || [ -z "${SUPABASE_ANON_KEY:-}" ]; then
+            echo "::error::Missing SUPABASE_URL or SUPABASE_ANON_KEY repository secret."
+            exit 1
+          fi
+
+          # Strip any trailing slash so the URL joins cleanly.
+          BASE="${SUPABASE_URL%/}"
+
+          # Retry a few times: a cold Free-plan project can be slow to respond,
+          # and one transient network blip should not fail the keepalive.
+          for attempt in 1 2 3 4 5; do
+            echo "--- attempt $attempt ---"
+
+            HTTP_CODE=$(curl -sS -o /tmp/resp.json -w '%{http_code}' \
+              --max-time 30 \
+              -X POST "$BASE/rest/v1/rpc/keepalive_ping" \
+              -H "apikey: $SUPABASE_ANON_KEY" \
+              -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+              -H "Content-Type: application/json" \
+              -d '{}' ) || HTTP_CODE=000
+
+            echo "HTTP $HTTP_CODE"
+            cat /tmp/resp.json; echo
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Keepalive ping succeeded."
+              echo "### ✅ Supabase pinged: $(cat /tmp/resp.json)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+
+            sleep $(( attempt * 15 ))
+          done
+
+          echo "::error::Keepalive ping failed after 5 attempts (last HTTP $HTTP_CODE)."
+          echo "### ❌ Supabase keepalive FAILED (HTTP $HTTP_CODE)" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      # -------------------------------------------------------------------
+      # GitHub disables scheduled workflows in a repository that has had no
+      # commit activity for 60 days -- which would silently kill your
+      # keepalive and then your database gets paused anyway. This step makes
+      # a tiny commit once a month so the repo never looks abandoned.
+      # -------------------------------------------------------------------
+      - name: Keep this workflow itself alive (monthly no-op commit)
+        if: success()
+        run: |
+          set -euo pipefail
+          # Only act on the 1st of the month.
+          if [ "$(date -u +%d)" != "01" ]; then
+            echo "Not the 1st of the month; skipping repo touch."
+            exit 0
+          fi
+
+          git clone --depth 1 \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" repo
+          cd repo
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p .keepalive
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive/last-run.txt
+
+          git add .keepalive/last-run.txt
+          git commit -m "chore: keepalive heartbeat [skip ci]" || { echo "nothing to commit"; exit 0; }
+          git push
